@@ -4,6 +4,7 @@
 @author Curve Finance
 @license MIT
 @notice Vests `ERC20CRV` tokens for multiple addresses over multiple vesting periods
+在多个vesting期内为多个地址vest ERC20CRV代币
 """
 
 

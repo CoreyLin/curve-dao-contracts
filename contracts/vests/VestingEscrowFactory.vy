@@ -4,11 +4,12 @@
 @author Curve Finance
 @license MIT
 @notice Stores and distributes `ERC20CRV` tokens by deploying `VestingEscrowSimple` contracts
+通过部署VestingEscrowSimple合约来存储和分发ERC20CRV令牌
 """
 
 from vyper.interfaces import ERC20
 
-MIN_VESTING_DURATION: constant(uint256) = 86400 * 365
+MIN_VESTING_DURATION: constant(uint256) = 86400 * 365 # 一年的秒数
 
 
 interface VestingEscrowSimple:
@@ -41,6 +42,8 @@ def __init__(_target: address, _admin: address):
     @dev Prior to deployment you must deploy one copy of `VestingEscrowSimple` which
          is used as a library for vesting contracts deployed by this factory
     @param _target `VestingEscrowSimple` contract address
+    合约构造函数
+    在部署factory合约之前，必须部署一个VestingEscrowSimple的副本，该副本被用作该工厂合约后续部署的vesting合约的库
     """
     self.target = _target
     self.admin = _admin
@@ -66,13 +69,26 @@ def deploy_vesting_contract(
     @param _can_disable Can admin disable recipient's ability to claim tokens?
     @param _vesting_duration Time period over which tokens are released
     @param _vesting_start Epoch time when tokens begin to vest
+    部署一个新的vesting合约
+    每个合约持有代币，为单个账户（地址）vest，即一个vesting合约对应一个账户。在调用本方法之前，代币必须通过常规的ERC20.transfer方法发送到本合约。
+    @param _token 正在分发的ERC20 token地址，即治理代币CRV token
+    @param _recipient 为谁vest tokens，即受益者
+    @param _amount 为_recipient vest的tokens数量
+    @param _can_disable 管理员可以禁用_recipient的claim tokens的能力吗?
+    @param _vesting_duration 释放代币的时间段，即时间长度
+    @param _vesting_start 代币开始vest的纪元时间
     """
     assert msg.sender == self.admin  # dev: admin only
+    # 必须在现在或未来的某个时间点开始vest，不能是过去的时间
     assert _vesting_start >= block.timestamp  # dev: start time too soon
+    # vest的时间至少持续一年
     assert _vesting_duration >= MIN_VESTING_DURATION  # dev: duration too short
 
+    # 部署一个VestingEscrowSimple合约
     _contract: address = create_forwarder_to(self.target)
+    # factory合约approve VestingEscrowSimple合约转移_amount数量的代币
     assert ERC20(_token).approve(_contract, _amount)  # dev: approve failed
+    # 初始化
     VestingEscrowSimple(_contract).initialize(
         self.admin,
         _token,
