@@ -72,7 +72,7 @@ INFLATION_DELAY: constant(uint256) = 86400 # 一天的秒数
 # Supply variables
 mining_epoch: public(int128)
 start_epoch_time: public(uint256)
-rate: public(uint256)
+rate: public(uint256) # rate初始值为0,至少要在部署CRV合约一天后才能更新rate为INITIAL_RATE
 
 start_epoch_supply: uint256
 
@@ -183,11 +183,20 @@ def future_epoch_time_write() -> uint256:
     @return Timestamp of the next epoch
     """
     _start_epoch_time: uint256 = self.start_epoch_time
-    if block.timestamp >= _start_epoch_time + RATE_REDUCTION_TIME:
+    if block.timestamp >= _start_epoch_time + RATE_REDUCTION_TIME: # 当前区块时间戳的判断非常重要
+        # 适合如下场景：
+        # start_epoch_time------------1 year later---block.timestamp---2 year later
+        # 更新为
+        # ----------------------------start_epoch_time-block.timestamp-future_epoch_time
         self._update_mining_parameters()
         return self.start_epoch_time + RATE_REDUCTION_TIME
     else:
+        # 适合如下场景：
+        # start_epoch_time---block.timestamp---1 year later
+        # 更新为
+        # start_epoch_time---block.timestamp---1 year later(future_epoch_time)
         return _start_epoch_time + RATE_REDUCTION_TIME
+    # 注意：future_epoch_time始终在block.timestamp的未来
 
 # 返回截止当前时间戳，代币总供应量的上限，即发币量的上限
 @internal
@@ -373,6 +382,7 @@ def mint(_to: address, _value: uint256) -> bool:
         self._update_mining_parameters()
 
     _total_supply: uint256 = self.total_supply + _value
+    # 如果在CRV合约部署后不满一天调用mint方法，会失败，因为下面这个assert会失败，不成立。所以，必须在部署CRV合约一天后才能调mint方法。
     assert _total_supply <= self._available_supply()  # dev: exceeds allowable mint amount
     self.total_supply = _total_supply
 

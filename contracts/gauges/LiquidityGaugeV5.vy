@@ -171,7 +171,9 @@ def __init__(_lp_token: address, _admin: address):
 
     self.period_timestamp[0] = block.timestamp # 当前时间戳设置为period_timestamp的第一个元素
     self.inflation_rate = CRV20(CRV).rate() # rate表示治理代币每秒释放的速度
-    self.future_epoch_time = CRV20(CRV).future_epoch_time_write() # 返回未来一年的start_epoch_time，如果治理代币合约刚刚部署，那么这个值就是部署第二天的时间戳
+    # 返回未来一年的start_epoch_time，如果治理代币合约刚刚部署，那么这个值就是部署第二天的时间戳
+    # 注意：future_epoch_time始终在block.timestamp的未来
+    self.future_epoch_time = CRV20(CRV).future_epoch_time_write()
 
     # 一种LP token对应一个liquidity gauge
     lp_symbol: String[26] = ERC20Extended(_lp_token).symbol()
@@ -184,7 +186,7 @@ def __init__(_lp_token: address, _admin: address):
         _abi_encode(EIP712_TYPEHASH, keccak256(name), keccak256(VERSION), chain.id, self)
     ) # TODO 这个空了再看
 
-    LP_TOKEN = _lp_token
+    LP_TOKEN = _lp_token # 一个pool的LP token
 
 
 @view
@@ -194,6 +196,9 @@ def integrate_checkpoint() -> uint256:
 
 
 # l是addr存入的LP token余额，L是gauge中总的LP token余额
+# 重点就是更新两个状态变量，一个是用户的，一个是全局的：
+# self.working_balances[addr]
+# self.working_supply
 @internal
 def _update_liquidity_limit(addr: address, l: uint256, L: uint256):
     """
@@ -234,6 +239,8 @@ def _update_liquidity_limit(addr: address, l: uint256, L: uint256):
     log UpdateLiquidityLimit(addr, l, L, lim, _working_supply)
 
 
+# 这个方法和CRV奖励无关，只和其他8种奖励有关。
+# 重点：计算用户的奖励数量时，和用户存入的LP token数量以及gauge中总的LP token数量有关系，和veCRV的数量没有任何关系。这一点和计算CRV奖励数量是不一样的，CRV奖励数量和veCRV就有关系了，即liquidity boosting。
 @internal
 def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _receiver: address):#TODO
     """
@@ -252,7 +259,7 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
                 # if no default receiver is set, direct claims to the user
                 receiver = _user
 
-    reward_count: uint256 = self.reward_count # 最大为8种奖励代币，CRV包含在其中
+    reward_count: uint256 = self.reward_count # 最大为8种奖励代币，不包含CRV，CRV不是奖励代币的一种
     for i in range(MAX_REWARDS):
         if i == reward_count:
             break
@@ -305,6 +312,8 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
                     self.claim_data[_user][token] = total_claimed + shift(total_claimable, 128)
 
 
+# 这个方法非常重要！和CRV代币奖励直接相关。
+# 重点：基本上所有外部操作（deposit,withdraw,user_checkpoint,claimable_tokens,transfer,kick）都会调用此方法。
 @internal
 def _checkpoint(addr: address):
     """
@@ -314,21 +323,43 @@ def _checkpoint(addr: address):
     # self.period是全局变量
     # self.period初始值是0,如果还没有任何用户调过_checkpoint，那么self.period=0
     # 注意：self.period和self.period_timestamp都是全局的状态变量，不是针对某一个用户的
+    # _checkpoint每次被调用时，self.period都会递增1,可以简单理解为一个计数器，记录状态更新的次数
     _period: int128 = self.period
     # 如果是第一次调用，就取第一个元素，就是gauge合约部署的时间戳
     _period_time: uint256 = self.period_timestamp[_period]
+    # _integrate_inv_supply代表当前这个gauge中每单位_working_supply本次累积的治理代币的数量，这是全局的
     # 如果第一次调用，那么_period=0,self.integrate_inv_supply的第一个元素是默认值0
     _integrate_inv_supply: uint256 = self.integrate_inv_supply[_period]
-    # 每秒代币的释放速度，是从治理代币ERC20取的
+    # 每秒代币的释放速度，是从治理代币ERC20取的。第一次取是gauge合约初始化的时候通过CRV20(CRV).rate()取的。
     rate: uint256 = self.inflation_rate
-    new_rate: uint256 = rate
+    new_rate: uint256 = rate # 把老rate的值赋值给新rate，只有prev_future_epoch >= _period_time时，才会重新从CRV取rate，然后赋值给新rate
     # 第一次调用时，self.future_epoch_time就是治理代币合约部署第二天的时间戳，_period_time是gauge合约部署的时间戳
     prev_future_epoch: uint256 = self.future_epoch_time
-    # 一种场景是gauge合约部署时间在治理代币合约部署后的一天内部署，时间顺序如下：
-    # 治理代币合约部署------------一天后，future_epoch_time
-    # -----------------gauge合约部署--------------------
+    
+    # 合约部署时间线通常如下：
+    # 1年前------CRV治理代币合约部署------1天后开始通货膨胀-----------------------------------------1年后
+    # CRV治理代币合约部署刚刚完成后，start_epoch_time是在1年前；如果1天后调用CRV合约，start_epoch_time就快进一年，到CRV合约部署后的一天后，如果不调用，还是保持在一年前。
+    # --------------------------------------------------gauge合约部署
+    # gauge合约部署时，_period_time就是部署时的时间戳；同时，调用CRV20(CRV).future_epoch_time_write()取future_epoch_time，然后赋值给prev_future_epoch。
+    # 不管CRV合约的start_epoch_time是在1年前还是在CRV合约部署一天后，按照future_epoch_time_write()的逻辑，取出的future_epoch_time都是在1年后，同时把start_epoch_time更新到CRV合约部署一天后
+    # ---------------------------------start_epoch_time---------------------------------------future_epoch_time
+    # 继续调用gauge合约部署
+    # --------------------------------------------------gauge合约部署----调用_checkpoint
+    # 这时，prev_future_epoch >= _period_time，进入下面这个分支，重新取future_epoch_time和rate，这时实际上取到的值不会变化，还是和之前一样，此处代码可以优化，不用进入if分支
+    # 但不管是否进入if分支，都会在下面的代码更新_period_time：
+    # ------------------------------------------------------------------_period_time
+    # 时间继续快进，在1年后，再调用_checkpoint
+    # --------------------------------------------------gauge合约部署----调用_checkpoint--------------------调用_checkpoint
+    # 这次调用的时候，由于_period_time还是第一次调用时更新的，所以prev_future_epoch >= _period_time依然成立，所以进入if分支，重新取future_epoch_time和rate，这时值就会有变化了，如下
+    # 1年前------CRV治理代币合约部署------1天后开始通货膨胀-----------------------------------------1年后-------------------------------2年后
+    # ----------------------------------------------------------------------------------------start_epoch_time-------------------future_epoch_time
+    # 可以看到，start_epoch_time和future_epoch_time都前进了一年
+    # 第一次调用_checkpoint和start_epoch_time之间的治理代币分配rate是第一年的rate，是老rate
+    # start_epoch_time和第二次调用_checkpoint之间的治理代币分配rate是第二年的rate，是新rate
+    # 所以，计算每单位每单位_working_supply累积的CRV代币时需要分段计算，然后相加
     if prev_future_epoch >= _period_time:
         # 重新从治理代币合约获取future_epoch_time和rate
+        # self.future_epoch_time只会在两个地方更新，一是合约初始化时，一是这里。
         self.future_epoch_time = CRV20(CRV).future_epoch_time_write()
         new_rate = CRV20(CRV).rate()
         self.inflation_rate = new_rate
@@ -390,8 +421,10 @@ def _checkpoint(addr: address):
             # 总结：block.timestamp有可能超过prev_week_time和week_time很多周，意味着很长时间可能都没有人调用该合约，所以循环固定500次，即最大支持计算过去500周
             week_time = min(week_time + WEEK, block.timestamp)
 
+    # 重点：基本上所有外部操作（deposit,withdraw,user_checkpoint,claimable_tokens,transfer,kick）都会更新以下状态变量，每次操作都会更新。
     _period += 1
     self.period = _period # 全局变量self.period递增1
+    # self.period_timestamp只会在两个地方更新，一是合约初始化时，一是这里。
     self.period_timestamp[_period] = block.timestamp # 全局变量，当前时间戳设置为self.period_timestamp的最新一个元素
     # 全局变量，每单位totalSupply从一开始到checkpoint，累积的治理代币数量，是一个数组
     self.integrate_inv_supply[_period] = _integrate_inv_supply
@@ -406,6 +439,8 @@ def _checkpoint(addr: address):
     self.integrate_checkpoint_of[addr] = block.timestamp # self.integrate_checkpoint_of[addr]代表每个用户最近一次checkpoint的时间戳
 
 
+# 此方法只能addr自己或者Minter合约有权限调用。Minter.vy的_mint_for方法就会调用此方法。
+# _checkpoint和_update_liquidity_limit就是用于更新一个用户的状态变量的，更新到最新的状态。
 @external
 def user_checkpoint(addr: address) -> bool:
     """
@@ -419,6 +454,10 @@ def user_checkpoint(addr: address) -> bool:
     return True
 
 
+# 查询还没有claim的CRV治理代币的数量，即用户还可以claim多少CRV治理代币
+# self.integrate_fraction[addr]代表用户从一开始积累到现在的CRV治理代币数量，包含已经claim和还未claim的
+# Minter(MINTER).minted(addr, self)表示用户已经claim的CRV治理代币数量。注意，这不是存在本合约里的，而是存储在Minter合约里的。
+# 二者相减就代表还未claim的数量
 @external
 def claimable_tokens(addr: address) -> uint256:
     """
@@ -426,10 +465,11 @@ def claimable_tokens(addr: address) -> uint256:
     @dev This function should be manually changed to "view" in the ABI
     @return uint256 number of claimable tokens per user
     """
-    self._checkpoint(addr)
+    self._checkpoint(addr) # 在计算之前，先更新一波状态
     return self.integrate_fraction[addr] - Minter(MINTER).minted(addr, self)
 
 
+# reward指的是除了CRV治理代币之外的其他类型的奖励token
 @view
 @external
 def claimed_reward(_addr: address, _token: address) -> uint256:#TODO
@@ -439,9 +479,11 @@ def claimed_reward(_addr: address, _token: address) -> uint256:#TODO
     @param _token Token to get reward amount for
     @return uint256 Total amount of `_token` already claimed by `_addr`
     """
+    # self.claim_data[_addr][_token]用低128位表示已经claim的奖励
     return self.claim_data[_addr][_token] % 2**128
 
 
+# reward指的是除了CRV治理代币之外的其他类型的奖励token
 @view
 @external
 def claimable_reward(_user: address, _reward_token: address) -> uint256:
@@ -461,9 +503,11 @@ def claimable_reward(_user: address, _reward_token: address) -> uint256:
     integral_for: uint256 = self.reward_integral_for[_reward_token][_user]
     new_claimable: uint256 = self.balanceOf[_user] * (integral - integral_for) / 10**18
 
+    # self.claim_data[_addr][_token]用高128位表示还未claim的奖励
     return shift(self.claim_data[_user][_reward_token], -128) + new_claimable
 
 
+# 把受益人改为他人
 @external
 def set_rewards_receiver(_receiver: address):
     """
@@ -474,6 +518,7 @@ def set_rewards_receiver(_receiver: address):
     self.rewards_receiver[msg.sender] = _receiver
 
 
+# reward指的是除了CRV治理代币之外的其他类型的奖励token
 @external
 @nonreentrant('lock')
 def claim_rewards(_addr: address = msg.sender, _receiver: address = ZERO_ADDRESS):#TODO
@@ -555,7 +600,7 @@ def withdraw(_value: uint256, _claim_rewards: bool = False):
     @dev Withdrawing also claims pending reward tokens
     @param _value Number of tokens to withdraw
     """
-    self._checkpoint(msg.sender)
+    self._checkpoint(msg.sender) # 更新状态
 
     if _value != 0:
         is_rewards: bool = self.reward_count != 0
@@ -563,14 +608,15 @@ def withdraw(_value: uint256, _claim_rewards: bool = False):
         if is_rewards:
             self._checkpoint_rewards(msg.sender, total_supply, _claim_rewards, ZERO_ADDRESS)
 
+        # 更新本合约存入的LP token的total supply，以及该用户在本合约存入的LP token的余额
         total_supply -= _value
         new_balance: uint256 = self.balanceOf[msg.sender] - _value
         self.balanceOf[msg.sender] = new_balance
         self.totalSupply = total_supply
 
-        self._update_liquidity_limit(msg.sender, new_balance, total_supply)
+        self._update_liquidity_limit(msg.sender, new_balance, total_supply) # 更新状态
 
-        ERC20(LP_TOKEN).transfer(msg.sender, _value)
+        ERC20(LP_TOKEN).transfer(msg.sender, _value) # 实际把LP token转回给msg.sender
 
     log Withdraw(msg.sender, _value)
     log Transfer(msg.sender, ZERO_ADDRESS, _value)
@@ -599,6 +645,7 @@ def _transfer(_from: address, _to: address, _value: uint256):
     log Transfer(_from, _to, _value)
 
 
+# 标准ERC20方法，用户在gauge合约存入LP token后，实际上就拥有了等量的gauge token，且gauge token可以转让
 @external
 @nonreentrant('lock')
 def transfer(_to : address, _value : uint256) -> bool:
@@ -811,6 +858,7 @@ def set_killed(_is_killed: bool):
     self.is_killed = _is_killed
 
 
+# admin提议未来的admin
 @external
 def commit_transfer_ownership(addr: address):
     """
@@ -823,6 +871,7 @@ def commit_transfer_ownership(addr: address):
     log CommitOwnership(addr)
 
 
+# admin让位，把admin让给已经提名的未来admin
 @external
 def accept_transfer_ownership():
     """
