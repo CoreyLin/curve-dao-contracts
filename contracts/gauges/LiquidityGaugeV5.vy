@@ -235,7 +235,7 @@ def _update_liquidity_limit(addr: address, l: uint256, L: uint256):
 
 
 @internal
-def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _receiver: address):
+def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _receiver: address):#TODO
     """
     @notice Claim pending rewards and checkpoint rewards for a user
     """
@@ -243,7 +243,8 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
     user_balance: uint256 = 0
     receiver: address = _receiver
     if _user != ZERO_ADDRESS:
-        user_balance = self.balanceOf[_user]
+        user_balance = self.balanceOf[_user] # user存入的LP token的余额
+        # 以下这段代码就是确定奖励token的receiver是谁，可以是msg.sender自己，也可以指定其他人
         if _claim and _receiver == ZERO_ADDRESS:
             # if receiver is not explicitly declared, check if a default receiver is set
             receiver = self.rewards_receiver[_user]
@@ -251,34 +252,42 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
                 # if no default receiver is set, direct claims to the user
                 receiver = _user
 
-    reward_count: uint256 = self.reward_count
+    reward_count: uint256 = self.reward_count # 最大为8种奖励代币，CRV包含在其中
     for i in range(MAX_REWARDS):
         if i == reward_count:
             break
-        token: address = self.reward_tokens[i]
+        token: address = self.reward_tokens[i] # 奖励token的地址
 
         integral: uint256 = self.reward_data[token].integral
         last_update: uint256 = min(block.timestamp, self.reward_data[token].period_finish)
-        duration: uint256 = last_update - self.reward_data[token].last_update
+        duration: uint256 = last_update - self.reward_data[token].last_update # 确定计算奖励的时间
         if duration != 0:
             self.reward_data[token].last_update = last_update
             if _total_supply != 0:
+                # 每种奖励token都有自己的全局rate，即每秒奖励多少代币给所有用户
+                # 此处计算的是每个LP token在duration的时间内积累了多少奖励token
                 integral += duration * self.reward_data[token].rate * 10**18 / _total_supply
                 self.reward_data[token].integral = integral
 
         if _user != ZERO_ADDRESS:
-            integral_for: uint256 = self.reward_integral_for[token][_user]
+            integral_for: uint256 = self.reward_integral_for[token][_user] # 每个用户计算奖励的起点
             new_claimable: uint256 = 0
 
             if integral_for < integral:
-                self.reward_integral_for[token][_user] = integral
-                new_claimable = user_balance * (integral - integral_for) / 10**18
+                self.reward_integral_for[token][_user] = integral # 更新用户的奖励起点
+                new_claimable = user_balance * (integral - integral_for) / 10**18 # 计算用户从上次claim到现在，新增的能claim的奖励代币的数量
 
             claim_data: uint256 = self.claim_data[_user][token]
+            # A positive _shift value equals a left shift, a negative value is a right shift.
+            # This function has been deprecated from version 0.3.8 onwards. Please use the << and >> operators instead.
+            # -128就是朝右边移动128位，即除以2**128。如果claim_data的高128位为0,那么移动之后，claim_data就是0,total_claimable=new_claimable
+            # 重点：claim_data的低128位用于表示总共已经claim的数量，高128位表示总共可以claim但还没有claim的数量。
             total_claimable: uint256 = shift(claim_data, -128) + new_claimable
             if total_claimable > 0:
-                total_claimed: uint256 = claim_data % 2**128
-                if _claim:
+                total_claimed: uint256 = claim_data % 2**128 # claim_data的低128位用于保存总共已经claim过的数量
+                if _claim: # 如果这次要claim
+                    # 实际调用奖励token的transfer方法，把相应奖励转给receiver。奖励包含之前没有claim的，以及本次新增的可以claim的。
+                    # 说明奖励token已经预先分配给了Gauge合约，然后再由Gauge合约二次分配。问题：什么时候，以及通过什么方式把奖励token分配给Gauge合约的？
                     response: Bytes[32] = raw_call(
                         token,
                         concat(
@@ -289,9 +298,10 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
                         max_outsize=32,
                     )
                     if len(response) != 0:
-                        assert convert(response, bool)
-                    self.claim_data[_user][token] = total_claimed + total_claimable
-                elif new_claimable > 0:
+                        assert convert(response, bool) # response需要为true
+                    self.claim_data[_user][token] = total_claimed + total_claimable # 实际claim之后，更新低128位，即总共已经claim过的数量
+                elif new_claimable > 0: # 如果这次不claim，并且new_claimable大于0
+                    # 不claim，就更新高128位，即能够claim的数量
                     self.claim_data[_user][token] = total_claimed + shift(total_claimable, 128)
 
 
@@ -422,7 +432,7 @@ def claimable_tokens(addr: address) -> uint256:
 
 @view
 @external
-def claimed_reward(_addr: address, _token: address) -> uint256:
+def claimed_reward(_addr: address, _token: address) -> uint256:#TODO
     """
     @notice Get the number of already-claimed reward tokens for a user
     @param _addr Account to get reward amount for
@@ -466,7 +476,7 @@ def set_rewards_receiver(_receiver: address):
 
 @external
 @nonreentrant('lock')
-def claim_rewards(_addr: address = msg.sender, _receiver: address = ZERO_ADDRESS):
+def claim_rewards(_addr: address = msg.sender, _receiver: address = ZERO_ADDRESS):#TODO
     """
     @notice Claim available reward tokens for `_addr`
     @param _addr Address to claim for
@@ -475,7 +485,9 @@ def claim_rewards(_addr: address = msg.sender, _receiver: address = ZERO_ADDRESS
                      for the caller
     """
     if _receiver != ZERO_ADDRESS:
+        # 这种场景就是msg.sender claim自己的rewards，然后转给别人。所以msg.sender不能claim别人的rewards。
         assert _addr == msg.sender  # dev: cannot redirect when claiming for another user
+    # self.totalSupply代表本合约存入的LP token的total supply
     self._checkpoint_rewards(_addr, self.totalSupply, True, _receiver)
 
 
