@@ -59,12 +59,15 @@ YEAR: constant(uint256) = 86400 * 365
 # left for inflation: 57%
 
 # Supply parameters
-INITIAL_SUPPLY: constant(uint256) = 1_303_030_303
+INITIAL_SUPPLY: constant(uint256) = 1_303_030_303 # 初始供应量13亿，会在初始化的时候分配给合约部署者
+# 一年释放2.7亿，INITIAL_RATE表示每秒释放的速度
 INITIAL_RATE: constant(uint256) = 274_815_283 * 10 ** 18 / YEAR  # leading to 43% premine
+# 每过一年，代币释放速率就减少
 RATE_REDUCTION_TIME: constant(uint256) = YEAR
+# 速度减少系数，1.1892
 RATE_REDUCTION_COEFFICIENT: constant(uint256) = 1189207115002721024  # 2 ** (1/4) * 1e18
 RATE_DENOMINATOR: constant(uint256) = 10 ** 18
-INFLATION_DELAY: constant(uint256) = 86400
+INFLATION_DELAY: constant(uint256) = 86400 # 一天的秒数
 
 # Supply variables
 mining_epoch: public(int128)
@@ -86,41 +89,66 @@ def __init__(_name: String[64], _symbol: String[32], _decimals: uint256):
     self.name = _name
     self.symbol = _symbol
     self.decimals = _decimals
-    self.balanceOf[msg.sender] = init_supply
+    self.balanceOf[msg.sender] = init_supply # 关键：初始供应量全部都分给msg.sender，即合约部署者，是一个EOA
     self.total_supply = init_supply
-    self.admin = msg.sender
+    self.admin = msg.sender # 中心化管理员
     log Transfer(ZERO_ADDRESS, msg.sender, init_supply)
 
+    # 假设当前时间是2023年5月29日MondayAM9点52分，计算之后的start_epoch_time就是
+    # 2022年5月30日MondayAM9点52分，就等于一年前的今天，再快进一天
     self.start_epoch_time = block.timestamp + INFLATION_DELAY - RATE_REDUCTION_TIME
-    self.mining_epoch = -1
+    self.mining_epoch = -1 # 初始值为-1
     self.rate = 0
     self.start_epoch_supply = init_supply
 
-
+# 此方法非常关键，用于每过一年更新如下参数：
+# self.start_epoch_time：增加一年
+# self.mining_epoch：递增1
+# self.start_epoch_supply：增加一年可以释放的代币数量
+# self.rate：代币释放速度，衰减1.1892，即/1.1892
+# 第一次调用比较特殊，在本合约部署一天后，当前时间戳距离初始self.start_epoch_time就会大于1年，那么就可以触发第一次调用，会更新如下值：
+# self.start_epoch_time：刚好到在本合约部署一天后的时间戳
+# self.mining_epoch：变为0
+# self.rate：设为INITIAL_RATE
+# self.start_epoch_supply：不会增加，依然保持init_supply
 @internal
 def _update_mining_parameters():
     """
     @dev Update mining rate and supply at the start of the epoch
          Any modifying mining call must also call this
     """
+    # self.rate只会在_update_mining_parameters方法中更新，其他地方不会更新。初始值为0.
     _rate: uint256 = self.rate
+    # self.start_epoch_supply的初始值是合约部署时的init_supply，也只会在_update_mining_parameters方法中更新。
     _start_epoch_supply: uint256 = self.start_epoch_supply
 
+    # self.start_epoch_time初始值是合约部署时间的一年前的今天，再快进一天。也只会在_update_mining_parameters方法中更新。
+    # 每调一次_update_mining_parameters，self.start_epoch_time就快进一年
+    # 实际上，在本合约部署一天后，当前时间戳距离初始self.start_epoch_time就会大于1年，那么第一次调用_update_mining_parameters时，self.start_epoch_time就快进一年，刚好到在本合约部署一天后的时间戳
     self.start_epoch_time += RATE_REDUCTION_TIME
+    # 初始值为-1,每调一次_update_mining_parameters，递增1. 也只会在_update_mining_parameters方法中更新。
+    # 实际上，在本合约部署一天后，当前时间戳距离初始self.start_epoch_time就会大于1年，那么第一次调用_update_mining_parameters时，self.mining_epoch就会从-1变成0
     self.mining_epoch += 1
 
     if _rate == 0:
+        # 第一次调_update_mining_parameters时，进入此分支
+        # _rate是初始值0，那么就取INITIAL_RATE。一年释放2.7亿，INITIAL_RATE表示每秒释放的速度，即2.7亿/一年的秒数
+        # 注意：首次调用此方法不会实际更新self.start_epoch_supply，只会更新self.start_epoch_time和self.mining_epoch
         _rate = INITIAL_RATE
     else:
+        # 第二次调_update_mining_parameters时，进入此分支
+        # 第二次：_rate是INITIAL_RATE。第三次：_rate是INITIAL_RATE/RATE_REDUCTION_COEFFICIENT(1.1892)。以此类推。
+        # self.start_epoch_time已经前进了一年，那么self.start_epoch_supply就需要加上一年可以释放的代币数量，即加上代币释放速度×一年的秒数
+        # 注意：可以释放的代币量意味着上限，但不一定真要实际释放这么多
         _start_epoch_supply += _rate * RATE_REDUCTION_TIME
         self.start_epoch_supply = _start_epoch_supply
-        _rate = _rate * RATE_DENOMINATOR / RATE_REDUCTION_COEFFICIENT
+        _rate = _rate * RATE_DENOMINATOR / RATE_REDUCTION_COEFFICIENT # 每过一年，代币释放速度就衰减1.1892
 
     self.rate = _rate
 
     log UpdateMiningParameters(block.timestamp, _rate, _start_epoch_supply)
 
-
+# 手工更新发币参数
 @external
 def update_mining_parameters():
     """
@@ -128,10 +156,10 @@ def update_mining_parameters():
     @dev Callable by any address, but only once per epoch
          Total supply becomes slightly larger if this function is called late
     """
-    assert block.timestamp >= self.start_epoch_time + RATE_REDUCTION_TIME  # dev: too soon!
+    assert block.timestamp >= self.start_epoch_time + RATE_REDUCTION_TIME  # dev: too soon!  一年才能调用一次
     self._update_mining_parameters()
 
-
+# 手工更新发币参数，同时返回self.start_epoch_time
 @external
 def start_epoch_time_write() -> uint256:
     """
@@ -146,7 +174,7 @@ def start_epoch_time_write() -> uint256:
     else:
         return _start_epoch_time
 
-
+# 手工更新发币参数，同时返回未来一年的start_epoch_time
 @external
 def future_epoch_time_write() -> uint256:
     """
@@ -161,13 +189,13 @@ def future_epoch_time_write() -> uint256:
     else:
         return _start_epoch_time + RATE_REDUCTION_TIME
 
-
+# 返回截止当前时间戳，代币总供应量的上限，即发币量的上限
 @internal
 @view
 def _available_supply() -> uint256:
     return self.start_epoch_supply + (block.timestamp - self.start_epoch_time) * self.rate
 
-
+# 返回截止当前时间戳，代币总供应量的上限，即发币量的上限
 @external
 @view
 def available_supply() -> uint256:
@@ -230,6 +258,7 @@ def set_minter(_minter: address):
     @param _minter Address of the minter
     """
     assert msg.sender == self.admin  # dev: admin only
+    # 此处只能设置一次minter，是否合理？
     assert self.minter == ZERO_ADDRESS  # dev: can set the minter only once, at creation
     self.minter = _minter
     log SetMinter(_minter)
@@ -330,22 +359,29 @@ def mint(_to: address, _value: uint256) -> bool:
     @param _value The amount that will be created
     @return bool success
     """
-    assert msg.sender == self.minter  # dev: minter only
+    assert msg.sender == self.minter  # dev: minter only  权限判断
     assert _to != ZERO_ADDRESS  # dev: zero address
 
+    # 假设本合约的部署时间是2023年5月29日MondayAM9点52分，计算之后的start_epoch_time就是
+    # 2022年5月30日MondayAM9点52分，就等于一年前的今天，再快进一天
+    # self.start_epoch_time + RATE_REDUCTION_TIME就是2023年5月30日MondayAM9点52分
+    # 也就是说，在部署CRV合约后，必须过24小时，才能进行mint
+    # 为什么要做这样的设计？
     if block.timestamp >= self.start_epoch_time + RATE_REDUCTION_TIME:
+        # 如果当前时间相比起最新的self.start_epoch_time，又过了一年，那么需要调用_update_mining_parameters，更新一些参数
+        # 一年才能更新一次
         self._update_mining_parameters()
 
     _total_supply: uint256 = self.total_supply + _value
     assert _total_supply <= self._available_supply()  # dev: exceeds allowable mint amount
     self.total_supply = _total_supply
 
-    self.balanceOf[_to] += _value
+    self.balanceOf[_to] += _value # 直接给_to加余额，而不是从admin转账给_to
     log Transfer(ZERO_ADDRESS, _to, _value)
 
     return True
 
-
+# 只能burn msg.sender自己的代币
 @external
 def burn(_value: uint256) -> bool:
     """

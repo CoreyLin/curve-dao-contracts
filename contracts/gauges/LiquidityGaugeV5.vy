@@ -6,7 +6,7 @@
 """
 from vyper.interfaces import ERC20
 
-implements: ERC20
+implements: ERC20 # 此合约本身也是ERC20合约
 
 
 interface CRV20:
@@ -31,6 +31,7 @@ interface VotingEscrow:
     def user_point_epoch(addr: address) -> uint256: view
     def user_point_history__ts(addr: address, epoch: uint256) -> uint256: view
 
+# 
 interface VotingEscrowBoost:
     def adjusted_balance_of(_account: address) -> uint256: view
 
@@ -149,12 +150,15 @@ inflation_rate: public(uint256)
 # The goal is to be able to calculate ∫(rate * balance / totalSupply dt) from 0 till checkpoint
 # All values are kept in units of being multiplied by 1e18
 period: public(int128)
+# period_timestamp是用于保存时间戳的数组
 period_timestamp: public(uint256[100000000000000000000000000000])
 
 # 1e18 * ∫(rate(t) / totalSupply(t) dt) from 0 till checkpoint
+# 每单位totalSupply从一开始到checkpoint，累积的治理代币数量，是一个数组
 integrate_inv_supply: public(uint256[100000000000000000000000000000])  # bump epoch when rate() changes
 
 
+# LP token就是ERC20流动性代币，同质化的，此处就是流动性池的地址，流动性池本身就是一个ERC20合约
 @external
 def __init__(_lp_token: address, _admin: address):
     """
@@ -165,18 +169,20 @@ def __init__(_lp_token: address, _admin: address):
 
     self.admin = _admin
 
-    self.period_timestamp[0] = block.timestamp
-    self.inflation_rate = CRV20(CRV).rate()
-    self.future_epoch_time = CRV20(CRV).future_epoch_time_write()
+    self.period_timestamp[0] = block.timestamp # 当前时间戳设置为period_timestamp的第一个元素
+    self.inflation_rate = CRV20(CRV).rate() # rate表示治理代币每秒释放的速度
+    self.future_epoch_time = CRV20(CRV).future_epoch_time_write() # 返回未来一年的start_epoch_time，如果治理代币合约刚刚部署，那么这个值就是部署第二天的时间戳
 
+    # 一种LP token对应一个liquidity gauge
     lp_symbol: String[26] = ERC20Extended(_lp_token).symbol()
     name: String[64] = concat("Curve.fi ", lp_symbol, " Gauge Deposit")
 
+    # liquidity gauge合约本身也是一个ERC20合约，有NAME,SYMBOL等属性
     NAME = name
     SYMBOL = concat(lp_symbol, "-gauge")
     DOMAIN_SEPARATOR = keccak256(
         _abi_encode(EIP712_TYPEHASH, keccak256(name), keccak256(VERSION), chain.id, self)
-    )
+    ) # TODO 这个空了再看
 
     LP_TOKEN = _lp_token
 
@@ -187,6 +193,7 @@ def integrate_checkpoint() -> uint256:
     return self.period_timestamp[self.period]
 
 
+# l是addr存入的LP token余额，L是gauge中总的LP token余额
 @internal
 def _update_liquidity_limit(addr: address, l: uint256, L: uint256):
     """
@@ -198,16 +205,29 @@ def _update_liquidity_limit(addr: address, l: uint256, L: uint256):
     @param L Total amount of liquidity (LP tokens)
     """
     # To be called after totalSupply is updated
-    voting_balance: uint256 = VotingEscrowBoost(VEBOOST_PROXY).adjusted_balance_of(addr)
+    # VEBOOST_PROXY是写死的地址
+    # https://github.com/curvefi/curve-veBoost/tree/master
+    # https://github.com/curvefi/curve-veBoost/blob/master/contracts/VotingEscrowDelegation.vy#L789
+    voting_balance: uint256 = VotingEscrowBoost(VEBOOST_PROXY).adjusted_balance_of(addr)#TODO 外部veBoost合约，先暂时不看逻辑
+    # 获取veCRV即voting power在当前时间戳的total supply，注意：随着时间的流逝，总量在时刻变化
+    # def totalSupply(t: uint256 = block.timestamp)，如果不传参，默认是传的当前时间戳
     voting_total: uint256 = ERC20(VOTING_ESCROW).totalSupply()
 
+    # TOKENLESS_PRODUCTION是40,意思就是lim=40%*l，如果没有boost，那就是这个数
     lim: uint256 = l * TOKENLESS_PRODUCTION / 100
     if voting_total > 0:
+        # 60%*L*(voting_balance/voting_total)
         lim += L * voting_balance / voting_total * (100 - TOKENLESS_PRODUCTION) / 100
+    # lim=40%*l+60%*L*(voting_balance/voting_total)
 
-    lim = min(l, lim)
+    lim = min(l, lim) # 取l和lim中小的那个，意味着最大就是l
     old_bal: uint256 = self.working_balances[addr]
-    self.working_balances[addr] = lim
+    self.working_balances[addr] = lim # 更新addr的working balance
+    # 一个用户的working balance不仅和l相关，还和自己持有的veCRV的voting_balance占总的veCRV的totalSupply有关（还和时间流逝相关），
+    # 所以，一个用户的working balance是动态变化的，此处做的动作就是“更新”用户的working balance，并不像传统ERC20那样，单纯在balance上增加或者减少amount，此处是更新balance本身
+    # 那么，方法就是把之前老的balance去掉，然后换成新的balance
+    # 注意，此处更新working_supply只会基于当前用户的balance变化来更新，并不会考虑其他用户，也没法考虑，其他用户成千上万。
+    # 其他用户l没有变，但是voting_balance / voting_total可能已经变了，但是管不了那么多了，没办法实时更新
     _working_supply: uint256 = self.working_supply + lim - old_bal
     self.working_supply = _working_supply
 
@@ -281,43 +301,63 @@ def _checkpoint(addr: address):
     @notice Checkpoint for a user
     @param addr User address
     """
+    # self.period是全局变量
+    # self.period初始值是0,如果还没有任何用户调过_checkpoint，那么self.period=0
+    # 注意：self.period和self.period_timestamp都是全局的状态变量，不是针对某一个用户的
     _period: int128 = self.period
+    # 如果是第一次调用，就取第一个元素，就是gauge合约部署的时间戳
     _period_time: uint256 = self.period_timestamp[_period]
+    # 如果第一次调用，那么_period=0,self.integrate_inv_supply的第一个元素是默认值0
     _integrate_inv_supply: uint256 = self.integrate_inv_supply[_period]
+    # 每秒代币的释放速度，是从治理代币ERC20取的
     rate: uint256 = self.inflation_rate
     new_rate: uint256 = rate
+    # 第一次调用时，self.future_epoch_time就是治理代币合约部署第二天的时间戳，_period_time是gauge合约部署的时间戳
     prev_future_epoch: uint256 = self.future_epoch_time
+    # 一种场景是gauge合约部署时间在治理代币合约部署后的一天内部署，时间顺序如下：
+    # 治理代币合约部署------------一天后，future_epoch_time
+    # -----------------gauge合约部署--------------------
     if prev_future_epoch >= _period_time:
+        # 重新从治理代币合约获取future_epoch_time和rate
         self.future_epoch_time = CRV20(CRV).future_epoch_time_write()
         new_rate = CRV20(CRV).rate()
         self.inflation_rate = new_rate
 
-    if self.is_killed:
+    if self.is_killed: # 特殊情况，被kill了就不能继续分配CRV代币了
         # Stop distributing inflation as soon as killed
         rate = 0
 
     # Update integral of 1/supply
+    # 更新每单位流动性
     if block.timestamp > _period_time:
-        _working_supply: uint256 = self.working_supply
-        Controller(GAUGE_CONTROLLER).checkpoint_gauge(self)
+        _working_supply: uint256 = self.working_supply # 先理解为gauge中存入的总的流动性数量
+        Controller(GAUGE_CONTROLLER).checkpoint_gauge(self) # 这是调用GaugeController的checkpoint_gauge方法，Gauge合约依赖于GaugeController合约
         prev_week_time: uint256 = _period_time
+        # 一周后，是round down到整周。如果当前时间戳还不到一周后，就取当前时间戳。如果取当前时间戳，那week_time就没有round down到整周。
         week_time: uint256 = min((_period_time + WEEK) / WEEK * WEEK, block.timestamp)
 
-        for i in range(500):
-            dt: uint256 = week_time - prev_week_time
+        for i in range(500): # 500是写死的，代表最大支持计算过去500周
+            dt: uint256 = week_time - prev_week_time # 距离最近的period_timestamp过去了多少时间
+            # 从GAUGE_CONTROLLER获取本gauge的weight，即每周每个weight应该分配多少代币。weight每周投票改变一次。
             w: uint256 = Controller(GAUGE_CONTROLLER).gauge_relative_weight(self, prev_week_time / WEEK * WEEK)
 
             if _working_supply > 0:
+                # prev_future_epoch的含义没搞懂
+                # 时间顺序为
+                # prev_week_time---prev_future_epoch---week_time
                 if prev_future_epoch >= prev_week_time and prev_future_epoch < week_time:
                     # If we went across one or multiple epochs, apply the rate
                     # of the first epoch until it ends, and then the rate of
                     # the last epoch.
                     # If more than one epoch is crossed - the gauge gets less,
                     # but that'd meen it wasn't called for more than 1 year
+                    # 计算当前这个gauge中每单位_working_supply本次累积的治理代币的数量，这是全局的
+                    # prev_week_time到prev_future_epoch用老的速率，prev_future_epoch到week_time用新的速率
                     _integrate_inv_supply += rate * w * (prev_future_epoch - prev_week_time) / _working_supply
                     rate = new_rate
                     _integrate_inv_supply += rate * w * (week_time - prev_future_epoch) / _working_supply
                 else:
+                    # 使用老速率计算当前这个gauge中每单位_working_supply本次累积的治理代币的数量，这是全局的
                     _integrate_inv_supply += rate * w * dt / _working_supply
                 # On precisions of the calculation
                 # rate ~= 10e18
@@ -328,19 +368,32 @@ def _checkpoint(addr: address):
 
             if week_time == block.timestamp:
                 break
-            prev_week_time = week_time
+            prev_week_time = week_time # week time之前累积的治理代币的数量已经计算过了，所以把week_time赋给prev_week_time，下次又从prev_week_time开始计算
+            # 两种场景：
+            # week n------------week n+1------------week n+2------------week n+3
+            # 场景一：
+            # prev_week_time----week_time---block.timestamp  这种情况更新后的week_time就是block.timestamp，下一次循环就会break
+            # 场景二：
+            # prev_week_time----week_time-------------------------block.timestamp
+            # 这种情况更新后的week_time如下，还是没到达block.timestamp，下一次循环不会break
+            # prev_week_time----week_time-----------new week_time-block.timestamp
+            # 总结：block.timestamp有可能超过prev_week_time和week_time很多周，意味着很长时间可能都没有人调用该合约，所以循环固定500次，即最大支持计算过去500周
             week_time = min(week_time + WEEK, block.timestamp)
 
     _period += 1
-    self.period = _period
-    self.period_timestamp[_period] = block.timestamp
+    self.period = _period # 全局变量self.period递增1
+    self.period_timestamp[_period] = block.timestamp # 全局变量，当前时间戳设置为self.period_timestamp的最新一个元素
+    # 全局变量，每单位totalSupply从一开始到checkpoint，累积的治理代币数量，是一个数组
     self.integrate_inv_supply[_period] = _integrate_inv_supply
 
     # Update user-specific integrals
-    _working_balance: uint256 = self.working_balances[addr]
+    # 更新当前用户相关的状态变量
+    _working_balance: uint256 = self.working_balances[addr] # 当前用户的working balance
+    # self.integrate_fraction[addr]是每个用户从一开始累积到现在的治理代币奖励数量
+    # self.integrate_inv_supply_of[addr]是每个用户更新self.integrate_fraction[addr]的起点，每次更新完self.integrate_fraction[addr]之后，都需要重置这个起点为全局的integrate_inv_supply
     self.integrate_fraction[addr] += _working_balance * (_integrate_inv_supply - self.integrate_inv_supply_of[addr]) / 10 ** 18
     self.integrate_inv_supply_of[addr] = _integrate_inv_supply
-    self.integrate_checkpoint_of[addr] = block.timestamp
+    self.integrate_checkpoint_of[addr] = block.timestamp # self.integrate_checkpoint_of[addr]代表每个用户最近一次checkpoint的时间戳
 
 
 @external
@@ -446,6 +499,7 @@ def kick(addr: address):
     self._update_liquidity_limit(addr, self.balanceOf[addr], self.totalSupply)
 
 
+# 1.存入LP tokens到本合约 2.claim还未取出的reward tokens，这个reward tokens指的是除了CRV治理代币之外的其他类型的奖励token
 @external
 @nonreentrant('lock')
 def deposit(_value: uint256, _addr: address = msg.sender, _claim_rewards: bool = False):
@@ -456,22 +510,26 @@ def deposit(_value: uint256, _addr: address = msg.sender, _claim_rewards: bool =
     @param _addr Address to deposit for
     """
 
-    self._checkpoint(_addr)
+    self._checkpoint(_addr) # 在deposit真正开始之前，先更新全局状态变量和用户相关的状态变量
 
     if _value != 0:
         is_rewards: bool = self.reward_count != 0
         total_supply: uint256 = self.totalSupply
-        if is_rewards:
+        if is_rewards: # 这是除了CRV治理代币之外，额外的奖励token，即其他类型的奖励，先暂时不看
             self._checkpoint_rewards(_addr, total_supply, _claim_rewards, ZERO_ADDRESS)
 
+        # 更新本合约存入的LP token的total supply，以及该用户在本合约存入的LP token的余额
         total_supply += _value
         new_balance: uint256 = self.balanceOf[_addr] + _value
         self.balanceOf[_addr] = new_balance
         self.totalSupply = total_supply
 
-        self._update_liquidity_limit(_addr, new_balance, total_supply)
+        # 更新状态变量：
+        # self.working_balances[addr]
+        # self.working_supply
+        self._update_liquidity_limit(_addr, new_balance, total_supply) #TODO
 
-        ERC20(LP_TOKEN).transferFrom(msg.sender, self, _value)
+        ERC20(LP_TOKEN).transferFrom(msg.sender, self, _value) # 把LP token从msg.sender转到本合约，首先需要msg.sender approve本合约
 
     log Deposit(_addr, _value)
     log Transfer(ZERO_ADDRESS, _addr, _value)
@@ -673,10 +731,12 @@ def add_reward(_reward_token: address, _distributor: address):
     """
     @notice Set the active reward contract
     """
+    # 只有admin才能调用
+    # 奖励token是一个外部的token，比如ERC20
     assert msg.sender == self.admin  # dev: only owner
 
-    reward_count: uint256 = self.reward_count
-    assert reward_count < MAX_REWARDS
+    reward_count: uint256 = self.reward_count # 奖励token的数量，因为有可能奖励token可能有多个
+    assert reward_count < MAX_REWARDS # 不能超过8个
     assert self.reward_data[_reward_token].distributor == ZERO_ADDRESS
 
     self.reward_data[_reward_token].distributor = _distributor

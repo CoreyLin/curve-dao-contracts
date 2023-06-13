@@ -39,15 +39,20 @@ def __init__(_token: address, _controller: address):
     self.controller = _controller
 
 
+# 这是核心方法
 @internal
 def _mint_for(gauge_addr: address, _for: address):
     assert GaugeController(self.controller).gauge_types(gauge_addr) >= 0  # dev: gauge is not added
 
     LiquidityGauge(gauge_addr).user_checkpoint(_for)
+    # 获取对于_for地址，总共可以mint的数量。注意：是累积数量
     total_mint: uint256 = LiquidityGauge(gauge_addr).integrate_fraction(_for)
+    # 该gauge总共可以mint的数量-该gauge已经mint的数量=本次需要mint的数量
     to_mint: uint256 = total_mint - self.minted[_for][gauge_addr]
 
     if to_mint != 0:
+        # 为_for地址mint MERC20代币。注意：不管是什么gauge，都是mint同一种代币
+        # 本合约有权利调用MERC20合约的mint方法，MERC20合约就是CRV合约，意味着Minter合约是CRV合约的minter
         MERC20(self.token).mint(_for, to_mint)
         self.minted[_for][gauge_addr] = total_mint
 

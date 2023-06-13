@@ -109,6 +109,8 @@ points_type_weight: public(HashMap[int128, HashMap[uint256, uint256]])  # type_i
 time_type_weight: public(uint256[1000000000])  # type_id -> last scheduled time (next week)
 
 
+# _token: CRV ERC20
+# _voting_escrow: veCRV
 @external
 def __init__(_token: address, _voting_escrow: address):
     """
@@ -122,7 +124,7 @@ def __init__(_token: address, _voting_escrow: address):
     self.admin = msg.sender
     self.token = _token
     self.voting_escrow = _voting_escrow
-    self.time_total = block.timestamp / WEEK * WEEK
+    self.time_total = block.timestamp / WEEK * WEEK # 当前时间戳，以整周为单位，是周四
 
 
 @external

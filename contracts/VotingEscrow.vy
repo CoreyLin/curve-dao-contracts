@@ -22,6 +22,10 @@
 # 0 +--------+------> time
 #       maxtime (4 years?)
 
+# 投票托管，时间加权投票。投票托管：把治理代币托管在此合约中，即lock治理代币，才能拥有投票权，以及获得分享协议利润的权利。
+# 投票的权重取决于时间，这样用户就会致力于未来(无论他们投票支持什么)。
+# 这个实现中的权重是线性的，锁定不能超过maxtime:
+
 struct Point:
     bias: int128 # 可正可负
     slope: int128  # - dweight / dt
@@ -31,6 +35,10 @@ struct Point:
 # and per block could be fairly bad b/c Ethereum changes blocktimes.
 # What we can do is to extrapolate ***At functions
 
+# 我们不能真正计算区块数量本身b/c斜率是每次，而不是每个区块，每个区块可能相当糟糕b/c以太坊改变区块时间。这里不懂。
+# 我们能做的是外推***At函数。这里不懂。
+
+# 1.锁定的治理代币的数量 2.解锁时间
 struct LockedBalance:
     amount: int128
     end: uint256 # 注意：只定义了解锁时间，即end时间，并不需要定义start时间，因为voting power只和两个因素相关：1.存的数量 2.当前时间戳到解锁时间的时间长度
@@ -82,22 +90,23 @@ event Supply:
     supply: uint256
 
 
-WEEK: constant(uint256) = 7 * 86400  # all future times are rounded by week
-MAXTIME: constant(uint256) = 4 * 365 * 86400  # 4 years
+WEEK: constant(uint256) = 7 * 86400  # all future times are rounded by week  一周的秒数
+MAXTIME: constant(uint256) = 4 * 365 * 86400  # 4 years  4年的秒数
 MULTIPLIER: constant(uint256) = 10 ** 18
 
 token: public(address)
 supply: public(uint256)
 
-locked: public(HashMap[address, LockedBalance])
+locked: public(HashMap[address, LockedBalance]) # 用户地址和托管余额的映射
 
 epoch: public(uint256)
-point_history: public(Point[100000000000000000000000000000])  # epoch -> unsigned point
+point_history: public(Point[100000000000000000000000000000])  # epoch -> unsigned point  Point数组
 user_point_history: public(HashMap[address, Point[1000000000]])  # user -> Point[user_epoch]
 user_point_epoch: public(HashMap[address, uint256])
 slope_changes: public(HashMap[uint256, int128])  # time -> signed slope change
 
 # Aragon's view methods for compatibility
+# Aragon是投票合约
 controller: public(address)
 transfersEnabled: public(bool)
 
@@ -108,9 +117,12 @@ decimals: public(uint256)
 
 # Checker for whitelisted (smart contract) wallets which are allowed to deposit
 # The goal is to prevent tokenizing the escrow
+# 允许存款的白名单(智能合约)钱包的检查器，即检查谁可以存款
+# 目标是防止代币化托管(escrow)
 future_smart_wallet_checker: public(address)
 smart_wallet_checker: public(address)
 
+# 本合约管理员，有中心化的成分
 admin: public(address)  # Can and will be a smart contract
 future_admin: public(address)
 
@@ -124,21 +136,28 @@ def __init__(token_addr: address, _name: String[64], _symbol: String[32], _versi
     @param _symbol Token symbol
     @param _version Contract version - required for Aragon compatibility
     """
+    """
+    @notice 合约构造函数
+    @param token_addr `ERC20CRV` token address，即治理代币地址
+    @param _name Token name，本ERC20合约name，即veCRV合约的name
+    @param _symbol Token symbol，veCRV合约的symbol
+    @param _version Contract version - required for Aragon compatibility。合约版本，为了和Aragon兼容。
+    """
     self.admin = msg.sender # 谁部署，谁就是合约的admin
     self.token = token_addr # CRV的地址，即治理代币的地址
-    self.point_history[0].blk = block.number # 当前区块号作为point_history第一个元素的区块号
+    self.point_history[0].blk = block.number # 当前区块号作为point_history数组第一个元素的区块号
     self.point_history[0].ts = block.timestamp # 当前区块时间戳作为point_history第一个元素的时间戳
     self.controller = msg.sender # 谁部署，谁就是合约的controller
     self.transfersEnabled = True
 
-    # 把CRV的decimals设置为veCRV的decimals
+    # 把CRV的decimals设置为veCRV的decimals，二者保持一致
     _decimals: uint256 = ERC20(token_addr).decimals()
     assert _decimals <= 255
     self.decimals = _decimals
 
     self.name = _name # ERC20 name
     self.symbol = _symbol # ERC20 symbol
-    self.version = _version # 版本，这个暂时不知道用途
+    self.version = _version # 版本，这个暂时不知道用途，只知道是为了和Aragon保持兼容性
 
 
 @external
@@ -196,7 +215,7 @@ def assert_not_contract(addr: address):
                 return # 是白名单合约
         raise "Smart contract depositors not allowed" # 不是白名单合约，抛异常
 
-
+# 获取指定地址的voting power衰减斜率。得到此斜率，再乘以时间长度，就可以得到经过一定时间后，voting power会衰减多少。
 @external
 @view
 def get_last_user_slope(addr: address) -> int128:
@@ -220,7 +239,7 @@ def user_point_history__ts(_addr: address, _idx: uint256) -> uint256:
     """
     return self.user_point_history[_addr][_idx].ts
 
-
+# 获取指定地址的CRV解锁时间
 @external
 @view
 def locked__end(_addr: address) -> uint256:
@@ -234,7 +253,7 @@ def locked__end(_addr: address) -> uint256:
 # 在deposit，增加amount，延长解锁时间，以及withdraw时调用
 # 这个方法是这个合约里最重要的，包含很多核心逻辑
 @internal
-def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBalance):#TODO
+def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBalance):
     """
     @notice Record global and per-user data to checkpoint
     @param addr User's wallet address. No user checkpoint if 0x0
@@ -416,7 +435,7 @@ def checkpoint():
 
 
 # msg.sender为某个地址（可以是自己）存CRV代币，并且锁定。_value是存的CRV的数量。
-# 注意：_addr必须之前已经锁定过CRV代币。
+# 注意：_addr必须之前已经锁定过CRV代币。意思就是非第一次锁定，第一次锁定是调用create_lock，第二次开始就调用deposit_for
 @external
 @nonreentrant('lock')
 def deposit_for(_addr: address, _value: uint256):
@@ -428,6 +447,7 @@ def deposit_for(_addr: address, _value: uint256):
     @param _value Amount to add to user's lock
     """
     # 取出_addr现有的LockedBalance，有两个属性：value和end
+    # self.locked是用户地址和托管余额的映射
     _locked: LockedBalance = self.locked[_addr]
 
     assert _value > 0  # dev: need non-zero value
@@ -437,7 +457,7 @@ def deposit_for(_addr: address, _value: uint256):
 
     self._deposit_for(_addr, _value, 0, self.locked[_addr], DEPOSIT_FOR_TYPE)
 
-
+# 首次存入CRV并且lock给定时间（不超过4年）。注意：是首次。
 @external
 @nonreentrant('lock')
 def create_lock(_value: uint256, _unlock_time: uint256):
@@ -458,7 +478,8 @@ def create_lock(_value: uint256, _unlock_time: uint256):
 
     self._deposit_for(msg.sender, _value, unlock_time, _locked, CREATE_LOCK_TYPE)
 
-
+# msg.sender为自己增加CRV deposit，即锁定更多的CRV到合约，解锁时间不变。
+# 和方法deposit_for的区别有两点：1.只能为msg.sender存储 2.msg.sender不能是合约地址
 @external
 @nonreentrant('lock')
 def increase_amount(_value: uint256):
@@ -468,7 +489,7 @@ def increase_amount(_value: uint256):
     @param _value Amount of tokens to deposit and add to the lock
     """
     # 增加锁定的数量，不修改过期时间
-    self.assert_not_contract(msg.sender)
+    self.assert_not_contract(msg.sender) # 合约不能调，必须是EOA
     _locked: LockedBalance = self.locked[msg.sender]
 
     assert _value > 0  # dev: need non-zero value
@@ -477,7 +498,11 @@ def increase_amount(_value: uint256):
 
     self._deposit_for(msg.sender, _value, 0, _locked, INCREASE_LOCK_AMOUNT)
 
-
+# 延长msg.sender的CRV的锁定时间
+# _unlock_time是新的lock end的时间戳，而不是一段duration
+# 比如，_unlock_time是1685348122，代表GMT: 2023年5月29日MondayAM8点15分
+# unlock_time=(_unlock_time / WEEK) * WEEK=1684972800，代表GMT: 2023年5月25日ThursdayAM12点00分，注意，是星期四
+# 前端调用这个方法的时候，如果是4年，可以直接传入参数=当前时间戳+4年的秒数
 @external
 @nonreentrant('lock')
 def increase_unlock_time(_unlock_time: uint256):
@@ -488,16 +513,18 @@ def increase_unlock_time(_unlock_time: uint256):
     # 延长msg.sender锁定的代币的过期时间
     self.assert_not_contract(msg.sender)
     _locked: LockedBalance = self.locked[msg.sender]
-    unlock_time: uint256 = (_unlock_time / WEEK) * WEEK  # Locktime is rounded down to weeks
+    unlock_time: uint256 = (_unlock_time / WEEK) * WEEK  # Locktime is rounded down to weeks，此处是相对于1970年1月1日ThursdayAM12点00分必须是整周，即星期四
 
-    assert _locked.end > block.timestamp, "Lock expired"
-    assert _locked.amount > 0, "Nothing is locked"
+    assert _locked.end > block.timestamp, "Lock expired" # 当前锁定的CRV还未过期
+    assert _locked.amount > 0, "Nothing is locked" # 当前锁定的数量不能为0
     assert unlock_time > _locked.end, "Can only increase lock duration" # 只能延长解锁时间，不能减小解锁时间
+    # unlock_time一定是星期四，block.timestamp + MAXTIME不一定是星期四
     assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 4 years max" # 注意，此处是基于当前时间戳，加上4年
 
     self._deposit_for(msg.sender, 0, unlock_time, _locked, INCREASE_UNLOCK_TIME)
 
-
+# 解锁时间到之后，取出锁定的CRV代币
+# 没到解锁时间，不能取
 @external
 @nonreentrant('lock')
 def withdraw():
@@ -553,7 +580,7 @@ def find_block_epoch(_block: uint256, max_epoch: uint256) -> uint256:
             _max = _mid - 1
     return _min
 
-
+# 获取指定地址当前的voting power，注意：随着时间的流逝，voting power时刻在变化
 @external
 @view
 def balanceOf(addr: address, _t: uint256 = block.timestamp) -> uint256:#TODO
@@ -578,7 +605,7 @@ def balanceOf(addr: address, _t: uint256 = block.timestamp) -> uint256:#TODO
             last_point.bias = 0
         return convert(last_point.bias, uint256)
 
-
+# 获取指定地址在指定区块号的voting power，注意：随着时间的流逝，voting power时刻在变化
 @external
 @view
 def balanceOfAt(addr: address, _block: uint256) -> uint256:#TODO 此方法还没细看
@@ -659,7 +686,7 @@ def supply_at(point: Point, t: uint256) -> uint256:
         last_point.bias = 0
     return convert(last_point.bias, uint256)
 
-
+# 获取veCRV即voting power在当前时间戳的total supply，注意：随着时间的流逝，总量在时刻变化
 @external
 @view
 def totalSupply(t: uint256 = block.timestamp) -> uint256:
@@ -672,7 +699,7 @@ def totalSupply(t: uint256 = block.timestamp) -> uint256:
     last_point: Point = self.point_history[_epoch]
     return self.supply_at(last_point, t)
 
-
+# 获取veCRV即voting power在指定区块号的total supply，注意：随着时间的流逝，总量在时刻变化
 @external
 @view
 def totalSupplyAt(_block: uint256) -> uint256:
@@ -700,7 +727,7 @@ def totalSupplyAt(_block: uint256) -> uint256:
 
 
 # Dummy methods for compatibility with Aragon
-
+# 此方法仅仅是为了和Aragon兼容
 @external
 def changeController(_newController: address):
     """

@@ -16,6 +16,7 @@ CRV: public(constant(address)) = 0xD533a949740bb3306d119CC777fa900bA034cd52
 contracts: public(address[100000])
 num_contracts: public(uint256)
 LEN_CACHED_CONTRACTS: constant(uint256) = 18
+# 以下合约所拥有的CRV供应量被视为非流通供应量
 cached_contracts: public(constant(address[LEN_CACHED_CONTRACTS])) = [
     0x41Df5d28C7e801c4df0aB33421E2ed6ce52D2567,  # new employees
     0x2b6509Ca3D0FB2CD1c00F354F119aa139f118bb3,  # vesting
@@ -61,9 +62,10 @@ def circulating_supply() -> uint256:
     """
     @notice Returns the circulating supply of CRV
     """
-    crv_total_supply: uint256 = ERC20(CRV).totalSupply()
-    not_circulating: uint256 = self._get_crv_balances_of_cached_contracts()
-    return crv_total_supply - not_circulating
+    # 返回CRV流通的供应量，注意：不是total supply，而是“流通”
+    crv_total_supply: uint256 = ERC20(CRV).totalSupply() # 总供应量
+    not_circulating: uint256 = self._get_crv_balances_of_cached_contracts() # 非流通的供应量
+    return crv_total_supply - not_circulating # 流通的供应量=总供应量-非流通的供应量
 
 
 @external
@@ -76,14 +78,14 @@ def set_admin(_new_admin: address):
     assert msg.sender == self.admin
     self.admin = _new_admin
 
-
+# 增加一个新的合约地址到contracts状态变量
 @internal
 def _add_contract(_contract: address):
     assert _contract not in self.contracts
     self.contracts[self.num_contracts] = _contract
     self.num_contracts += 1
 
-
+# 返回cached_contracts和contracts中所有合约拥有的CRV的总量，视为CRV非流通供应量
 @internal
 @view
 def _get_crv_balances_of_cached_contracts() -> uint256:
